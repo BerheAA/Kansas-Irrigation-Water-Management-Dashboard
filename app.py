@@ -11,7 +11,7 @@ from datetime import date, datetime, timedelta
 # -------------------------
 
 st.set_page_config(
-    page_title="Kansas Irrigation Water Management Dashboard",
+    page_title="Kansas Irrigation Water Management V1",
     layout="wide"
 )
 
@@ -508,7 +508,7 @@ def simulate_irrigation(
 # MAIN APP LAYOUT
 # -------------------------
 
-st.title("Kansas Irrigation Water Management Dashboard")
+st.title("Kansas Irrigation Water Management V1")
 st.caption(
     "Prototype decision support tool for ET-based irrigation scheduling and water planning "
     "across Kansas (for demonstration and Extension use)."
