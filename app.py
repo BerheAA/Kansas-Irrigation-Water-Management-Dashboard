@@ -3,6 +3,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
+import time
 from datetime import date, datetime, timedelta
 
 # -------------------------
@@ -155,6 +156,41 @@ IRRIGATION_SYSTEMS = {
 # WEATHER FUNCTIONS
 # -------------------------
 
+
+def safe_empty_weather():
+    """Standard empty weather dataframe used when API/upload data are unavailable."""
+    return pd.DataFrame(columns=["time", "precip_mm", "et0_mm", "tmax_c", "tmin_c"])
+
+
+def request_json_with_retry(url, params=None, method="GET", data=None, timeout=20, max_retries=3):
+    """
+    Request JSON with simple retry/backoff.
+    This reduces dashboard failure when Open-Meteo temporarily returns 429 Too Many Requests.
+    """
+    last_error = None
+
+    for attempt in range(max_retries):
+        try:
+            if method.upper() == "POST":
+                response = requests.post(url, data=data, timeout=timeout)
+            else:
+                response = requests.get(url, params=params, timeout=timeout)
+
+            if response.status_code == 429:
+                last_error = Exception("429 Too Many Requests")
+                time.sleep(2 * (attempt + 1))
+                continue
+
+            response.raise_for_status()
+            return response.json(), None
+
+        except Exception as e:
+            last_error = e
+            time.sleep(2 * (attempt + 1))
+
+    return None, last_error
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_archive_weather(lat, lon, start_date, end_date):
     params = {
         "latitude": lat,
@@ -169,16 +205,10 @@ def fetch_archive_weather(lat, lon, start_date, end_date):
         ],
         "timezone": "America/Chicago",
     }
-    try:
-        r = requests.get(OPEN_METEO_ARCHIVE_URL, params=params, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-    except Exception as e:
-        st.warning(f"Could not retrieve historical weather data: {e}")
-        return pd.DataFrame()
-
-    if "daily" not in data:
-        return pd.DataFrame()
+    data, err = request_json_with_retry(OPEN_METEO_ARCHIVE_URL, params=params, timeout=20)
+    if err is not None or not data or "daily" not in data:
+        st.warning(f"Could not retrieve historical weather data: {err}")
+        return safe_empty_weather()
 
     daily = data["daily"]
     df = pd.DataFrame(daily)
@@ -195,6 +225,7 @@ def fetch_archive_weather(lat, lon, start_date, end_date):
     return df
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_forecast_weather(lat, lon, start_date, end_date):
     from datetime import date as _date
     days_ahead = (end_date - _date.today()).days
@@ -217,16 +248,10 @@ def fetch_forecast_weather(lat, lon, start_date, end_date):
         "past_days": 0,
     }
 
-    try:
-        r = requests.get(OPEN_METEO_FORECAST_URL, params=params, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-    except Exception as e:
-        st.warning(f"Could not retrieve forecast weather data: {e}")
-        return pd.DataFrame()
-
-    if "daily" not in data:
-        return pd.DataFrame()
+    data, err = request_json_with_retry(OPEN_METEO_FORECAST_URL, params=params, timeout=20)
+    if err is not None or not data or "daily" not in data:
+        st.warning(f"Could not retrieve forecast weather data: {err}")
+        return safe_empty_weather()
 
     daily = data["daily"]
     df = pd.DataFrame(daily)
@@ -394,7 +419,7 @@ def simulate_irrigation(
     rainfall_efficiency=0.8,
 ):
     if df_weather is None or df_weather.empty:
-        return None, None
+        return None, None, safe_empty_weather()
 
     crop = CROP_PARAMS[crop_name]
     soil = SOIL_TYPES[soil_name]
@@ -464,7 +489,7 @@ def simulate_irrigation(
     yield_index = float(np.clip(yield_index, 0.3, 1.05))
     rel_yield = yield_index
 
-    return irrigation_df, {
+    summary = {
         "taw_mm": taw,
         "readily_available_mm": readily_available,
         "total_etc_mm": etc_cum,
@@ -473,6 +498,10 @@ def simulate_irrigation(
         "n_irrigations": 0 if irrigation_df is None or irrigation_df.empty else len(irrigation_df),
         "total_irrigation_mm": 0.0 if irrigation_df is None or irrigation_df.empty else float(irrigation_df["irrigation_mm"].sum()),
     }
+
+    # Return the daily dataframe with computed water-balance columns.
+    # This is the key fix for the KeyError at the time-series chart.
+    return irrigation_df, summary, df
 
 
 # -------------------------
@@ -687,7 +716,7 @@ if run_button:
         if df_weather is None or df_weather.empty:
             st.error("No weather / climate data available for this configuration.")
         else:
-            irr_df, summary = simulate_irrigation(
+            irr_df, summary, df_weather = simulate_irrigation(
                 df_weather,
                 crop_name,
                 soil_name,
@@ -814,16 +843,25 @@ if run_button:
                 else:
                     st.info("No irrigation events were triggered in this simulation.")
 
-                ts = df_weather[["time", "soil_storage_mm", "deficit_mm"]].copy()
-                ts = ts.rename(
-                    columns={
-                        "time": "Date",
-                        "soil_storage_mm": "Soil storage (mm)",
-                        "deficit_mm": "Deficit (mm)",
-                    }
-                )
+                required_ts_cols = ["time", "soil_storage_mm", "deficit_mm"]
+                missing_ts_cols = [c for c in required_ts_cols if c not in df_weather.columns]
+
                 st.markdown("##### Soil water storage & deficit")
-                st.line_chart(ts.set_index("Date"))
+                if missing_ts_cols or df_weather.empty:
+                    st.warning(
+                        "Soil water balance columns are unavailable, so the time-series chart was skipped. "
+                        f"Missing columns: {missing_ts_cols}"
+                    )
+                else:
+                    ts = df_weather[required_ts_cols].copy()
+                    ts = ts.rename(
+                        columns={
+                            "time": "Date",
+                            "soil_storage_mm": "Soil storage (mm)",
+                            "deficit_mm": "Deficit (mm)",
+                        }
+                    )
+                    st.line_chart(ts.set_index("Date"))
 
                 st.caption(
                     "Values are conceptual and for demonstration only. For operational scheduling, "
